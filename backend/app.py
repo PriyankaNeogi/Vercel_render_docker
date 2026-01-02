@@ -5,11 +5,9 @@ import os
 import io
 import gc
 import base64
-import threading
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -28,7 +26,7 @@ from PIL import Image
 # =========================
 # FASTAPI
 # =========================
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -48,25 +46,28 @@ from transformers import CLIPProcessor, CLIPModel
 # =========================
 # APP INIT
 # =========================
-app = FastAPI(title="Multimodal RAG (Render Free Optimized)")
+app = FastAPI(title="Multimodal RAG (Groq + CLIP)")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # =========================
-# GLOBAL STATE
+# GLOBAL STATE (IMPORTANT)
 # =========================
 vector_store = None
 image_store = {}
-is_indexing = False
 
 clip_model = None
 clip_processor = None
-clip_lock = threading.Lock()
+
+# Render-safe flags
+is_indexing = False
+is_ready = False
 
 # =========================
 # LAZY LOAD CLIP (SAFE)
@@ -74,22 +75,21 @@ clip_lock = threading.Lock()
 def load_clip():
     global clip_model, clip_processor
 
-    with clip_lock:
-        if clip_model is None:
-            clip_model = CLIPModel.from_pretrained(
-                "openai/clip-vit-base-patch32"
-            )
-            clip_model.eval()
+    if clip_model is None or clip_processor is None:
+        clip_model = CLIPModel.from_pretrained(
+            "openai/clip-vit-base-patch32"
+        )
+        clip_model.eval()
 
-            clip_processor = CLIPProcessor.from_pretrained(
-                "openai/clip-vit-base-patch32",
-                use_fast=False
-            )
+        clip_processor = CLIPProcessor.from_pretrained(
+            "openai/clip-vit-base-patch32",
+            use_fast=False
+        )
 
-            torch.set_grad_enabled(False)
+        torch.set_grad_enabled(False)
 
 # =========================
-# EMBEDDINGS
+# EMBEDDING FUNCTIONS
 # =========================
 def embed_text(text: str):
     load_clip()
@@ -101,17 +101,20 @@ def embed_text(text: str):
             truncation=True,
             max_length=77
         )
-        feats = clip_model.get_text_features(**inputs)
-    feats = feats / feats.norm(dim=-1, keepdim=True)
-    return feats.squeeze().cpu().numpy()
+        features = clip_model.get_text_features(**inputs)
+
+    features = features / features.norm(dim=-1, keepdim=True)
+    return features.squeeze().cpu().numpy()
+
 
 def embed_image(image: Image.Image):
     load_clip()
     with torch.no_grad():
         inputs = clip_processor(images=image, return_tensors="pt")
-        feats = clip_model.get_image_features(**inputs)
-    feats = feats / feats.norm(dim=-1, keepdim=True)
-    return feats.squeeze().cpu().numpy()
+        features = clip_model.get_image_features(**inputs)
+
+    features = features / features.norm(dim=-1, keepdim=True)
+    return features.squeeze().cpu().numpy()
 
 # =========================
 # LLM
@@ -128,151 +131,162 @@ class QueryRequest(BaseModel):
     question: str
 
 # =========================
-# PDF PROCESSOR (THREAD)
+# BACKGROUND PDF PROCESSOR
 # =========================
-def process_pdf_sync(file_bytes: bytes):
-    global vector_store, image_store, is_indexing
+def process_pdf(file: UploadFile):
+    global vector_store, image_store, is_indexing, is_ready
 
     is_indexing = True
-    image_store.clear()
+    is_ready = False
 
-    pdf = fitz.open(stream=file_bytes, filetype="pdf")
+    try:
+        pdf = fitz.open(stream=file.file.read(), filetype="pdf")
 
-    docs = []
-    embeddings = []
+        docs = []
+        embeddings = []
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=400,
-        chunk_overlap=80
-    )
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=100
+        )
 
-    #  HARD LIMIT FOR FREE TIER
-    MAX_PAGES = 3
+        for page_num, page in enumerate(pdf):
 
-    for page_num, page in enumerate(pdf):
-        if page_num >= MAX_PAGES:
-            break
-
-        text = page.get_text()
-        if text.strip():
-            base_doc = Document(
-                page_content=text,
-                metadata={"page": page_num, "type": "text"}
-            )
-            for chunk in splitter.split_documents([base_doc]):
-                docs.append(chunk)
-                embeddings.append(embed_text(chunk.page_content))
-
-        for img_index, img in enumerate(page.get_images(full=True)):
-            try:
-                base = pdf.extract_image(img[0])
-                pil = Image.open(io.BytesIO(base["image"])).convert("RGB")
-
-                img_id = f"p{page_num}_i{img_index}"
-                buf = io.BytesIO()
-                pil.save(buf, format="PNG")
-
-                image_store[img_id] = base64.b64encode(buf.getvalue()).decode()
-
-                docs.append(
-                    Document(
-                        page_content="[IMAGE]",
-                        metadata={
-                            "page": page_num,
-                            "type": "image",
-                            "image_id": img_id
-                        }
-                    )
+            text = page.get_text()
+            if text.strip():
+                temp_doc = Document(
+                    page_content=text,
+                    metadata={"page": page_num, "type": "text"}
                 )
 
-                embeddings.append(embed_image(pil))
-            except:
-                pass
+                for chunk in splitter.split_documents([temp_doc]):
+                    docs.append(chunk)
+                    embeddings.append(embed_text(chunk.page_content))
 
-    pdf.close()
+            for img_index, img in enumerate(page.get_images(full=True)):
+                try:
+                    base = pdf.extract_image(img[0])
+                    image_bytes = base["image"]
 
-    vector_store = FAISS.from_embeddings(
-        list(zip([d.page_content for d in docs], embeddings)),
-        embedding=None,
-        metadatas=[d.metadata for d in docs]
-    )
+                    pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-    gc.collect()
-    is_indexing = False
+                    image_id = f"page_{page_num}_img_{img_index}"
+
+                    buf = io.BytesIO()
+                    pil_image.save(buf, format="PNG")
+
+                    image_store[image_id] = base64.b64encode(
+                        buf.getvalue()
+                    ).decode()
+
+                    docs.append(
+                        Document(
+                            page_content=f"[IMAGE on page {page_num}]",
+                            metadata={
+                                "page": page_num,
+                                "type": "image",
+                                "image_id": image_id
+                            }
+                        )
+                    )
+
+                    embeddings.append(embed_image(pil_image))
+
+                except Exception as e:
+                    print("Image error:", e)
+
+        pdf.close()
+
+        vector_store = FAISS.from_embeddings(
+            text_embeddings=list(zip([d.page_content for d in docs], embeddings)),
+            embedding=None,
+            metadatas=[d.metadata for d in docs]
+        )
+
+        is_ready = True
+
+    finally:
+        is_indexing = False
+        gc.collect()
+        torch.cuda.empty_cache()
 
 # =========================
-# UPLOAD ENDPOINT
+# PDF UPLOAD ENDPOINT
 # =========================
 @app.post("/upload-pdf")
-def upload_pdf(file: UploadFile = File(...)):
-    global is_indexing
-
-    if is_indexing:
-        return {"error": "Indexing already in progress"}
-
-    data = file.file.read()
-
-    thread = threading.Thread(
-        target=process_pdf_sync,
-        args=(data,)
-    )
-    thread.start()
-
+def upload_pdf(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    background_tasks.add_task(process_pdf, file)
     return {"status": "PDF upload started. Processing in background."}
 
 # =========================
-# QUERY ENDPOINT
-# =========================
-@app.post("/query")
-def query_rag(req: QueryRequest):
-    if is_indexing:
-        return {"error": "PDF is still processing. Please wait 30 seconds."}
-
-    if vector_store is None:
-        return {"error": "No document indexed yet"}
-
-    query_vec = embed_text(req.question)
-
-    results = vector_store.similarity_search_by_vector(query_vec, k=3)
-
-    text_ctx = []
-    img_ctx = []
-
-    for d in results:
-        if d.metadata["type"] == "text":
-            text_ctx.append(f"[Page {d.metadata['page']}] {d.page_content}")
-        else:
-            img_ctx.append(f"Image on page {d.metadata['page']}")
-
-    prompt = f"""
-You are a multimodal assistant.
-
-TEXT CONTEXT:
-{chr(10).join(text_ctx)}
-
-IMAGE CONTEXT:
-{chr(10).join(img_ctx)}
-
-QUESTION:
-{req.question}
-
-Answer clearly.
-"""
-
-    return {"answer": llm.invoke(prompt).content}
-
-# =========================
-# STATUS (IMPORTANT)
+# STATUS ENDPOINT (CRITICAL)
 # =========================
 @app.get("/status")
 def status():
     return {
         "is_indexing": is_indexing,
-        "indexed": vector_store is not None
+        "indexed": is_ready
     }
 
 # =========================
-# HEALTH
+# QUERY ENDPOINT (RENDER SAFE)
+# =========================
+@app.post("/query")
+def query_rag(request: QueryRequest):
+
+    if is_indexing:
+        return {
+            "error": "PDF is still processing. Please wait and try again."
+        }
+
+    if not is_ready or vector_store is None:
+        return {
+            "error": "No document indexed yet."
+        }
+
+    query_embedding = embed_text(request.question)
+
+    results = vector_store.similarity_search_by_vector(
+        query_embedding,
+        k=5
+    )
+
+    text_context = []
+    image_context = []
+
+    for doc in results:
+        if doc.metadata["type"] == "text":
+            text_context.append(
+                f"[Page {doc.metadata['page']}]: {doc.page_content}"
+            )
+        else:
+            image_context.append(
+                f"Image detected on page {doc.metadata['page']}"
+            )
+
+    prompt = f"""
+You are a multimodal assistant.
+
+TEXT CONTEXT:
+{chr(10).join(text_context)}
+
+IMAGE CONTEXT:
+{chr(10).join(image_context)}
+
+QUESTION:
+{request.question}
+
+Answer clearly and accurately.
+"""
+
+    response = llm.invoke(prompt)
+    return {"answer": response.content}
+
+# =========================
+# HEALTH CHECK
 # =========================
 @app.get("/")
 def health():
