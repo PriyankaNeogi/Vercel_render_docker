@@ -65,6 +65,9 @@ image_store = {}
 clip_model = None
 clip_processor = None
 
+# 👉 NEW FLAG (FIXES 502)
+is_indexing = False
+
 # =========================
 # LAZY LOAD CLIP (RENDER SAFE)
 # =========================
@@ -131,7 +134,9 @@ class QueryRequest(BaseModel):
 # BACKGROUND PDF PROCESSOR
 # =========================
 def process_pdf(file: UploadFile):
-    global vector_store, image_store
+    global vector_store, image_store, is_indexing
+
+    is_indexing = True
 
     pdf = fitz.open(stream=file.file.read(), filetype="pdf")
 
@@ -145,7 +150,7 @@ def process_pdf(file: UploadFile):
 
     for page_num, page in enumerate(pdf):
 
-        # -------- TEXT --------
+        # ---------- TEXT ----------
         text = page.get_text()
         if text.strip():
             temp_doc = Document(
@@ -157,7 +162,7 @@ def process_pdf(file: UploadFile):
                 docs.append(chunk)
                 embeddings.append(embed_text(chunk.page_content))
 
-        # -------- IMAGES --------
+        # ---------- IMAGES ----------
         for img_index, img in enumerate(page.get_images(full=True)):
             try:
                 base = pdf.extract_image(img[0])
@@ -205,6 +210,8 @@ def process_pdf(file: UploadFile):
     gc.collect()
     torch.cuda.empty_cache()
 
+    is_indexing = False
+
 # =========================
 # PDF UPLOAD ENDPOINT
 # =========================
@@ -221,6 +228,9 @@ def upload_pdf(
 # =========================
 @app.post("/query")
 def query_rag(request: QueryRequest):
+    if is_indexing:
+        return {"error": "PDF is still being processed. Please wait."}
+
     if vector_store is None:
         return {"error": "No document indexed yet"}
 
