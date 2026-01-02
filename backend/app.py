@@ -66,17 +66,16 @@ clip_model = None
 clip_processor = None
 
 # =========================
-# LAZY LOAD CLIP
+# LAZY LOAD CLIP (RENDER SAFE)
 # =========================
 def load_clip():
     global clip_model, clip_processor
 
     if clip_model is None or clip_processor is None:
         clip_model = CLIPModel.from_pretrained(
-            "openai/clip-vit-base-patch32",
-            torch_dtype=torch.float32,
-            device_map="cpu"
+            "openai/clip-vit-base-patch32"
         )
+        clip_model = clip_model.to("cpu")
         clip_model.eval()
 
         clip_processor = CLIPProcessor.from_pretrained(
@@ -146,6 +145,7 @@ def process_pdf(file: UploadFile):
 
     for page_num, page in enumerate(pdf):
 
+        # -------- TEXT --------
         text = page.get_text()
         if text.strip():
             temp_doc = Document(
@@ -157,6 +157,7 @@ def process_pdf(file: UploadFile):
                 docs.append(chunk)
                 embeddings.append(embed_text(chunk.page_content))
 
+        # -------- IMAGES --------
         for img_index, img in enumerate(page.get_images(full=True)):
             try:
                 base = pdf.extract_image(img[0])
