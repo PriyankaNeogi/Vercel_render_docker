@@ -1,11 +1,10 @@
 fastapi
 uvicorn
-python-multipart
 python-dotenv
+pymupdf
 torch
 transformers
 pillow
-pymupdf
 langchain
 langchain-community
 langchain-groq
