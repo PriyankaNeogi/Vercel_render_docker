@@ -146,7 +146,7 @@ def process_pdf_sync(file_bytes: bytes):
         chunk_overlap=80
     )
 
-    # 🔴 HARD LIMIT FOR FREE TIER
+    #  HARD LIMIT FOR FREE TIER
     MAX_PAGES = 3
 
     for page_num, page in enumerate(pdf):
