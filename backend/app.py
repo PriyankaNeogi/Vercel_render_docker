@@ -48,9 +48,6 @@ from transformers import CLIPProcessor, CLIPModel
 # =========================
 app = FastAPI(title="Multimodal RAG (Groq + CLIP)")
 
-# =========================
-# CORS (CRITICAL FIX)
-# =========================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -65,26 +62,35 @@ app.add_middleware(
 vector_store = None
 image_store = {}
 
-# =========================
-# LOAD CLIP ONCE
-# =========================
-print("Loading CLIP model once...")
+clip_model = None
+clip_processor = None
 
-clip_model = CLIPModel.from_pretrained(
-    "openai/clip-vit-base-patch32",
-    low_cpu_mem_usage=True
-)
-clip_model.eval()
+# =========================
+# LAZY LOAD CLIP
+# =========================
+def load_clip():
+    global clip_model, clip_processor
 
-clip_processor = CLIPProcessor.from_pretrained(
-    "openai/clip-vit-base-patch32",
-    use_fast=False
-)
+    if clip_model is None or clip_processor is None:
+        clip_model = CLIPModel.from_pretrained(
+            "openai/clip-vit-base-patch32",
+            torch_dtype=torch.float32,
+            device_map="cpu"
+        )
+        clip_model.eval()
+
+        clip_processor = CLIPProcessor.from_pretrained(
+            "openai/clip-vit-base-patch32",
+            use_fast=False
+        )
+
+        torch.set_grad_enabled(False)
 
 # =========================
 # EMBEDDING FUNCTIONS
 # =========================
 def embed_text(text: str):
+    load_clip()
     with torch.no_grad():
         inputs = clip_processor(
             text=text,
@@ -100,6 +106,7 @@ def embed_text(text: str):
 
 
 def embed_image(image: Image.Image):
+    load_clip()
     with torch.no_grad():
         inputs = clip_processor(images=image, return_tensors="pt")
         features = clip_model.get_image_features(**inputs)
@@ -139,7 +146,6 @@ def process_pdf(file: UploadFile):
 
     for page_num, page in enumerate(pdf):
 
-        # TEXT
         text = page.get_text()
         if text.strip():
             temp_doc = Document(
@@ -151,7 +157,6 @@ def process_pdf(file: UploadFile):
                 docs.append(chunk)
                 embeddings.append(embed_text(chunk.page_content))
 
-        # IMAGES
         for img_index, img in enumerate(page.get_images(full=True)):
             try:
                 base = pdf.extract_image(img[0])
@@ -197,7 +202,7 @@ def process_pdf(file: UploadFile):
     )
 
     gc.collect()
-    print(f"PDF indexed with {len(docs)} chunks")
+    torch.cuda.empty_cache()
 
 # =========================
 # PDF UPLOAD ENDPOINT
@@ -208,7 +213,7 @@ def upload_pdf(
     background_tasks: BackgroundTasks = None
 ):
     background_tasks.add_task(process_pdf, file)
-    return {"status": "PDF upload started. Indexing in background."}
+    return {"status": "PDF upload started"}
 
 # =========================
 # QUERY ENDPOINT
